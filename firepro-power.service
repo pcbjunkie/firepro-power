@@ -1,0 +1,13 @@
+[Unit]
+Description=FirePro S7150 power limit and clocks (firepro-power)
+# before anything can start GPU work: loading a PowerPlay table re-initializes the GPU's power management
+After=systemd-modules-load.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/firepro-power apply
+
+[Install]
+WantedBy=multi-user.target

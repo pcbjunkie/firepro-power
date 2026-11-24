@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# firepro-power: raise (or restore) the chip power limit of AMD FirePro GPUs with Tonga-format PowerPlay tables
+# (Tonga, Fiji, Polaris; tested on the FirePro S7150 / S7150 x2) at runtime, and pin their clocks. The power
+# limit is changed by loading a patched copy of the card's own PowerPlay table through
+# /sys/class/drm/cardN/device/pp_table: no VBIOS flash, and a reboot always brings back the stock limits.
+#
+#   firepro-power show                       limits, power, temperature and clocks of every card
+#   firepro-power set <watts> [cards...]     load a table with this chip power limit (root)
+#   firepro-power stock [cards...]           load the card's original table again (root)
+#   firepro-power dpm <high|auto|peak> [cards...]   pin clocks high / hand them back to the driver (root)
+#   firepro-power apply                      boot-time: set + dpm from /etc/default/firepro-power (root)
+#
+# Options: --force  write the table although processes hold the GPU device files (only when none of them is
+#                   running GPU work: the driver re-initializes power management when a table is loaded)
+#          --unsafe allow limits above stock + 35% (up to stock + 85%)
+#
+# The first time a card is touched after boot, its table is saved to /run/firepro-power/<pci address>.bin (the
+# stock table: /run is emptied at every boot), and every later change patches that copy.
+set -euo pipefail
+
+LIBDIR=${FIREPRO_POWER_LIB:-$(dirname "$(readlink -f "$0")")}
+[ -f "$LIBDIR/pptable.py" ] || LIBDIR=/usr/local/lib/firepro-power
+PPTABLE="$LIBDIR/pptable.py"
+STATE=/run/firepro-power
+# limits relative to each card's stock TDP, in percent (S7150: 81 W stock -> 110 W safe)
+SAFE_PCT=135
+HARD_PCT=185
+
+force=0; unsafe=0; args=()
+for a in "$@"; do
+    case "$a" in
+        --force) force=1 ;;
+        --unsafe) unsafe=1 ;;
+        -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) args+=("$a") ;;
+    esac
+done
+set -- "${args[@]+"${args[@]}"}"
+cmd=${1:-show}
+[ $# -gt 0 ] && shift
+
+die() { echo "firepro-power: $*" >&2; exit 1; }
+need_root() { [ "$(id -u)" -eq 0 ] || die "run as root: sudo $0 $cmd ${*:-}"; }
+
+# AMD GPUs with a Tonga-format (revision 7) PowerPlay table
+all_cards() {
+    for c in /sys/class/drm/card[0-9]*; do
+        [ -f "$c/device/pp_table" ] || continue
+        [ "$(cat "$c/device/vendor" 2>/dev/null)" = "0x1002" ] || continue
+        [ "$(python3 "$PPTABLE" get "$c/device/pp_table" ucTableFormatRevision 2>/dev/null)" = "7" ] || continue
+        echo "$c"
+    done
+}
+
+select_cards() {   # selected names (card1 ...) or all
+    local all; all=$(all_cards)
+    [ -n "$all" ] || die "no AMD GPU with a Tonga-format PowerPlay table found"
+    if [ $# -eq 0 ]; then echo "$all"; return; fi
+    for want in "$@"; do
+        local hit=""
+        for c in $all; do [ "$(basename "$c")" = "$want" ] && hit=$c; done
+        [ -n "$hit" ] || die "no such card: $want (have: $(for c in $all; do printf '%s ' "$(basename "$c")"; done))"
+        echo "$hit"
+    done
+}
+
+addr() { basename "$(readlink -f "$1/device")"; }
+hwmon() { ls -d "$1"/device/hwmon/hwmon* | head -1; }
+
+show() {
+    for c in $(all_cards); do
+        local h; h=$(hwmon "$c")
+        printf '%s %s: cap %d W (max %d W), now %d W, %d C, dpm %s, sclk %s\n' "$(basename "$c")" "$(addr "$c")" \
+            $(( $(cat "$h/power1_cap") / 1000000 )) $(( $(cat "$h/power1_cap_max") / 1000000 )) \
+            $(( $(cat "$h/power1_average") / 1000000 )) $(( $(cat "$h/temp1_input") / 1000 )) \
+            "$(cat "$c/device/power_dpm_force_performance_level")" \
+            "$(grep '\*' "$c/device/pp_dpm_sclk" | tr -d ' *' | cut -d: -f2)"
+    done
+}
+
+# refuse while processes hold the GPUs' device files, unless --force
+check_busy() {
+    local busy="" c n r
+    for c in "$@"; do
+        n=$(basename "$c")
+        r=$(ls "$c/device/drm" | grep renderD || true)
+        for d in /dev/dri/$n ${r:+/dev/dri/$r}; do busy="$busy $(fuser "$d" 2>/dev/null || true)"; done
+    done
+    busy=$(echo "$busy" | tr ' ' '\n' | grep -v '^$' | sort -un || true)
+    [ -z "$busy" ] && return 0
+    echo "GPU device files held open by:" >&2
+    for pid in $busy; do echo "  $pid $(ps -o user=,comm= -p "$pid" 2>/dev/null)" >&2; done
+    [ "$force" -eq 1 ] && { echo "--force: going ahead" >&2; return 0; }
+    die "stop GPU work first; if none of these runs GPU work (desktop compositor, logind), rerun with --force"
+}
+
+# the table this card booted with
+stock_table() {
+    local c=$1 f; f="$STATE/$(addr "$c").bin"
+    mkdir -p "$STATE"
+    if [ ! -f "$f" ]; then
+        cat "$c/device/pp_table" > "$f"
+        local tdp small
+        read -r tdp small < <(python3 "$PPTABLE" get "$f" usTDP usSmallPowerLimit | paste -sd' ')
+        if [ "$tdp" != "$small" ]; then
+            rm -f "$f"
+            die "$(basename "$c"): its table looks modified already (TDP $tdp W, small power limit $small W); reboot to get the stock table back"
+        fi
+    fi
+    echo "$f"
+}
+
+set_watts() {
+    local w=$1; shift
+    [[ "$w" =~ ^[0-9]+$ ]] || die "watts must be a number"
+    local cards; cards=$(select_cards "$@")
+    for c in $cards; do stock_table "$c" > /dev/null; done
+    check_busy $cards
+    for c in $cards; do
+        local st tdp tdc
+        st=$(stock_table "$c")
+        read -r tdp tdc < <(python3 "$PPTABLE" get "$st" usTDP usTDC | paste -sd' ')
+        local safe=$(( (tdp * SAFE_PCT + 99) / 100 )) max   # rounded up: 81 W -> 110 W
+        max=$safe
+        [ "$unsafe" -eq 1 ] && max=$(( (tdp * HARD_PCT + 99) / 100 ))
+        [ "$w" -ge "$tdp" ] && [ "$w" -le "$max" ] || die "$(basename "$c"): watts must be $tdp..$max (stock $tdp W; above $safe W needs --unsafe)"
+        local out="$STATE/$(addr "$c")-${w}w.bin"
+        # current limit (TDC) scales with the power limit
+        python3 "$PPTABLE" patch "$st" "$out" tdp="$w" maxpower="$w" tdc=$(( tdc * w / tdp )) > /dev/null
+        cat "$out" > "$c/device/pp_table"
+        echo "$(basename "$c"): ${w} W"
+    done
+}
+
+set_stock() {
+    local cards; cards=$(select_cards "$@")
+    check_busy $cards
+    for c in $cards; do
+        local f; f="$STATE/$(addr "$c").bin"
+        [ -f "$f" ] || { echo "$(basename "$c"): not changed since boot"; continue; }
+        cat "$f" > "$c/device/pp_table"
+        echo "$(basename "$c"): stock table"
+    done
+}
+
+set_dpm() {
+    local mode=${1:-}; [ $# -gt 0 ] && shift
+    case "$mode" in high|auto|low) ;; peak) mode=profile_peak ;; *) die "dpm mode: high, auto or peak" ;; esac
+    for c in $(select_cards "$@"); do
+        echo "$mode" > "$c/device/power_dpm_force_performance_level"
+        echo "$(basename "$c"): dpm $mode"
+    done
+}
+
+case "$cmd" in
+    show) show ;;
+    set) need_root; [ $# -ge 1 ] || die "usage: set <watts> [cards...]"; set_watts "$@"; show ;;
+    stock) need_root; set_stock "$@"; show ;;
+    dpm) need_root; set_dpm "$@"; show ;;
+    apply)
+        need_root
+        WATTS=""; DPM=""; CARDS=""
+        [ -f /etc/default/firepro-power ] && . /etc/default/firepro-power
+        # at boot the driver may still be probing the cards
+        for _ in $(seq 30); do [ -n "$(all_cards)" ] && break; sleep 1; done
+        force=1   # runs before any GPU work (ordered before the display manager)
+        # shellcheck disable=SC2086
+        [ -n "$WATTS" ] && set_watts "$WATTS" $CARDS
+        # shellcheck disable=SC2086
+        [ -n "$DPM" ] && set_dpm "$DPM" $CARDS
+        show ;;
+    *) die "unknown command $cmd (show, set, stock, dpm, apply; --help)" ;;
+esac

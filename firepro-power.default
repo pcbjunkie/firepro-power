@@ -1,0 +1,8 @@
+# /etc/default/firepro-power: read by "firepro-power apply" (the firepro-power.service at boot)
+# Chip power limit in watts (stock S7150: 81). Empty: leave the limit alone. At most stock + 35% (S7150: 110);
+# more needs --unsafe, which the boot service does not pass.
+WATTS=110
+# Clock mode: high (pin the highest clocks), auto (driver default), peak (profiling mode). Empty: leave it.
+DPM=high
+# Cards to touch, e.g. "card1 card2". Empty: all supported cards.
+CARDS=""
